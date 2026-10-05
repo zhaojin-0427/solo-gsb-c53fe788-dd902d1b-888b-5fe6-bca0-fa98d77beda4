@@ -177,7 +177,13 @@ def solve_scenario(sid: int, req: SolveRequest):
         "cores": res.cores,
         "truncated": res.truncated,
     }
-    store.save_result(sid, result, R, H)
+    # Persist conclusive results.  An inconclusive run (status "unknown": the
+    # time limit expired before any take-off table was witnessed) must not
+    # overwrite a result already stored — the stored plan may be the only
+    # known conflict-free schedule, and the page and execution batches are
+    # built from it.
+    if res.status != "unknown" or row["result"] is None:
+        store.save_result(sid, result, R, H)
     return _scenario_summary(sid, sorties, R, H, pcs,
                              solve_result=result,
                              earliest_conflicts=earliest)

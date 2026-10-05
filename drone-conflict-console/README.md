@@ -26,6 +26,9 @@
   - 第一目标：**加权总延误** `Σ w_i · x_i`（相对于各自最早起飞时刻）最小；
   - 第二目标：在最优目标值相同的方案中，取**按架次 ID 排序的起飞时刻序列字典序最小**，
     结果唯一、可复现。
+  - 分阶段证明：可行性探测 → 加权延误最小化 → 逐架次字典序择优，共享同一个
+    时限预算；每阶段保留与已证明约束一致的最佳候选起飞表，超时回退到该候选，
+    状态按证明完备度标记 `optimal` / `feasible`（详见“求解与无解说明”）。
 - **无解诊断**：无解时列出若干**包含关系极小**的无解架次集合（删去其中任意一架次，
   其余架次即可消解），并给出每对架次的**互斥时差**（后者起飞 − 前者起飞，秒）。
 - **锁定重算**：在页面勾选锁定并填写某些架次的整数秒偏移，重新求解其余架次。
@@ -89,7 +92,7 @@ drone-conflict-console/
 ├── examples/endpoint_meet.json  # 两架次仅在航段端点同一时刻相遇（瞬时冲突复盘演练）
 ├── scripts/
 │   └── verify_multiprocess.py  # 双进程共库并发上报的 HTTP 级验证脚本
-├── tests/               # 几何交叉验证 + 求解器暴力验证 + 批次/预警语义
+├── tests/               # 几何交叉验证 + 求解器暴力/分阶段验证 + 批次/预警语义
 ├── requirements.txt
 ├── Dockerfile
 └── docker-compose.yml
@@ -256,7 +259,7 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 ---
 
-## 求解与无解说说明（建模要点）
+## 求解与无解说明（建模要点）
 
 - **互斥时差**：对架次 A、B，若 `x_B − x_A` 落入某整数区间 `[lo, hi]` 就会冲突，
   则求解器施加析取约束 `x_B − x_A ≥ hi+1 ∨ x_B − x_A ≤ lo−1`。
@@ -265,8 +268,22 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 - **无解核（MUS）**：每个架次带一个“参与”布尔并作为 CP-SAT 假设；
   返回的不可满足核心天然是包含关系极小的。再通过“强制某架次退出”分支，
   枚举出更多极小集合，并附带每对架次的互斥时差。
-- 目标采用两阶段优化：先最小化加权总延误并固定最优值，
-  再按架次 ID 逐个最小化偏移，得到唯一的字典序最优时刻序列。
+- 目标采用分阶段优化，全部阶段**共享同一个时限预算**：先做可行性探测找到一张
+  可行起飞表，再最小化加权总延误，最后在已证明的最优目标值下按架次 ID 逐个
+  最小化偏移，得到唯一的字典序最优时刻序列。
+- **阶段性结果判定**：每个阶段都保留与**已证明约束**一致的最佳候选起飞表，
+  新见证仅在加权延误不更差时才替换候选；某阶段超时（UNKNOWN）即回退到当前
+  候选，绝不丢弃已找到的可行表。字典序轮次只在**该轮本身证明 OPTIMAL** 时才
+  锁定该架次偏移；仅获 FEASIBLE 的轮次采用其见证表但不锁定、不再继续证明。
+  因此响应状态 `status` 的语义为：
+  - `optimal`：加权目标与**全部**字典序轮次均证明 OPTIMAL，结果唯一可复现；
+  - `feasible`：已找到有效（无冲突、满足锁定）的起飞表但证明未完成，
+    `weighted_delay` 为当前最佳上界，方案照常入库、可保存、可创建执行批次；
+  - `infeasible`：**已证明**无解，附包含关系极小的无解架次集合；
+  - `unknown`：时限内连一张可行表都未找到（既非可行也非证明无解）。
+- **超时不覆盖已知方案**：`unknown` 的求解结果**不会写入 SQLite 覆盖**已保存的
+  求解结果——页面回看与执行批次创建仍使用上一份已落库的方案；只有得出确定结论
+  （`optimal` / `feasible` / `infeasible`）或该场景尚无任何结果时才落库。
 
 ---
 
@@ -275,7 +292,7 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 | 方法 | 路径 | 作用 |
 | --- | --- | --- |
 | `POST` | `/api/import` | 导入航迹 JSON，返回架次/互斥时差/最早起飞冲突 |
-| `POST` | `/api/scenarios/{id}/solve` | 按（可覆盖的）安全参数与锁定重算 |
+| `POST` | `/api/scenarios/{id}/solve` | 按（可覆盖的）安全参数与锁定重算；状态 `optimal`/`feasible`/`infeasible`/`unknown` 按证明完备度判定，`unknown` 不覆盖已存方案 |
 | `POST` | `/api/scenarios/{id}/save` | 命名保存当前方案（含输入快照） |
 | `GET` | `/api/scenarios` | 已保存方案列表 |
 | `GET` | `/api/scenarios/{id}` | 回看某个方案（输入快照 + 求解结果） |
@@ -748,6 +765,7 @@ HTTP API 完全相同。
 pip install -r requirements.txt
 python tests/test_geometry_crossval.py     # 几何：解析法 vs 连续扫描 vs 密采样
 python tests/test_solver_bruteforce.py 2026  # 求解器：对照暴力枚举（含无解核极小性）
+python tests/test_solve_stages.py          # 求解器：分阶段候选保留/超时回退/状态判定与落库规则
 python tests/test_batches_warning.py       # 批次：修订协议/多进程共库并发/预警分类与冲突/复盘节点与区间差分
 python tests/test_workzone_window.py       # 作业区：圆柱占用解析几何 vs 密采样/闭区间相切/逾期与拒绝/安全窗口
 ```
@@ -756,6 +774,12 @@ python tests/test_workzone_window.py       # 作业区：圆柱占用解析几�
   连续时间区间剖分、密采样神谕）对上千个随机航段对与擦边案例做一致性校验；
 - `test_solver_bruteforce.py` 在小窗口下穷举所有起飞组合，验证最优目标、
   字典序择优、锁定约束以及无解核的可行性与包含极小性；
+- `test_solve_stages.py` 用脚本化求解器桩确定性重演各阶段超时：优化阶段
+  UNKNOWN 回退到可行性探测的见证表、候选仅被不更差的见证替换、字典序轮次
+  仅获 FEASIBLE 时不锁定未证实偏移且不标 `optimal`、UNKNOWN 轮次保留上一份
+  候选、只有加权目标与全部字典序轮次均 OPTIMAL 才标 `optimal`、`infeasible`
+  与 `unknown` 严格区分；并经 HTTP API 验证超时的 `unknown` 结果不覆盖
+  SQLite 中已保存的方案、确定结论（含 `feasible`）照常落库并决定能否创建批次；
 - `test_batches_warning.py` 验证批次冻结、首版为 1/严格递增/幂等/冲突、
   **两个 OS 进程共享同一 SQLite 文件时并发上报仍只留最高修订号**（用
   `multiprocessing` 真起两个进程对同一文件做条件写入，含修订 2/3 竞争与

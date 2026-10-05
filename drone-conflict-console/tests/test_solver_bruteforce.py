@@ -111,10 +111,22 @@ def main(seed=2026, cases=60):
                 continue
             ids_sorted = sorted(s.id for s in sorties)
             seq = tuple(res.offsets[i] for i in ids_sorted)
-            if res.weighted_delay != bf_obj or seq != bf_seq:
-                print(f"case {case}: solver obj={res.weighted_delay} seq={seq} "
-                      f"BF obj={bf_obj} seq={bf_seq}")
-                fails += 1
+            if res.status == "optimal":
+                # Fully proven: exact objective and lex-smallest sequence.
+                if res.weighted_delay != bf_obj or seq != bf_seq:
+                    print(f"case {case}: solver obj={res.weighted_delay} seq={seq} "
+                          f"BF obj={bf_obj} seq={bf_seq}")
+                    fails += 1
+            else:
+                # Witnessed but unproven ("feasible"): the table must still be
+                # valid and its delay an upper bound of the true optimum.
+                if res.status != "feasible":
+                    print(f"case {case}: unexpected status {res.status}")
+                    fails += 1
+                if res.weighted_delay < bf_obj:
+                    print(f"case {case}: unproven delay {res.weighted_delay} "
+                          f"below true optimum {bf_obj}")
+                    fails += 1
             # verify solved schedule really has no conflicts
             rec = scan_schedule(sorties, res.offsets, R, H)
             if rec:
