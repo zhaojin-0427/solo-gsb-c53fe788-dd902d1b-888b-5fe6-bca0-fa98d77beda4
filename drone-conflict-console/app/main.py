@@ -159,6 +159,18 @@ def solve_scenario(sid: int, req: SolveRequest):
 
     pcs = build_pair_constraints(sorties, R, H)
     res = run_solve(sorties, pcs, locks, time_limit=req.time_limit)
+
+    # A time-out that proved nothing must never destroy a previously proven
+    # feasible take-off table in SQLite: the re-solve response falls back to
+    # the stored plan (and its thresholds), batches created from it stay valid.
+    # A genuine infeasibility proof still replaces the stored result, and "no
+    # prior solution" leaves the unknown status visible to the page/API.
+    prior = row.get("result")
+    keep_prior = res.status == "unknown" and bool(prior and prior.get("feasible"))
+    if keep_prior:
+        R, H = row["safety_radius"], row["safety_height"]
+        pcs = build_pair_constraints(sorties, R, H)
+
     earliest = scan_schedule(sorties, {s.id: 0 for s in sorties}, R, H)
     solved_conflicts = []
     if res.feasible:
@@ -177,9 +189,13 @@ def solve_scenario(sid: int, req: SolveRequest):
         "cores": res.cores,
         "truncated": res.truncated,
     }
-    store.save_result(sid, result, R, H)
+    if keep_prior:
+        effective_result = prior
+    else:
+        store.save_result(sid, result, R, H)
+        effective_result = result
     return _scenario_summary(sid, sorties, R, H, pcs,
-                             solve_result=result,
+                             solve_result=effective_result,
                              earliest_conflicts=earliest)
 
 

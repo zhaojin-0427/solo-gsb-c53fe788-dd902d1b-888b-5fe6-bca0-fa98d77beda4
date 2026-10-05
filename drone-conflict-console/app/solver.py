@@ -9,9 +9,23 @@ Pipeline:
 
 2. A CP-SAT model chooses one integer take-off offset ``x_i`` per sortie
    (earliest take-off is 0, latest is the sortie's window end), disjunctively
-   avoiding every forbidden interval.  Objective: weighted total delay with
-   respect to earliest take-off, ties broken by the lexicographically
-   smallest sequence of offsets ordered by sortie ID.
+   avoiding every forbidden interval.  The solve runs in three stages that
+   share one wall-clock deadline:
+
+   a. feasibility probe (all sorties participating);
+   b. weighted-total-delay minimisation with respect to earliest take-off;
+   c. lexicographic minimisation of the offset sequence ordered by sortie ID,
+      never worsening the incumbent objective.
+
+   A proven feasible table from any stage is kept as the incumbent and is
+   replaced only by a witness satisfying every constraint proven earlier; a
+   later stage returning UNKNOWN (time-out) therefore falls back to the
+   incumbent instead of discarding it.  The result is ``optimal`` only when
+   the weighted stage and *all* lexicographic rounds are proven optimal, and
+   ``feasible`` when a valid table exists but its proof did not finish.  A
+   FEASIBLE lexicographic round never pins its coordinate as if proven.  A
+   probe that finds neither a witness nor a proof returns ``unknown``,
+   distinct from a proven ``infeasible``.
 
 3. On infeasibility, every *sortie* carries a participation boolean (assumed
    true); each pair's avoidance clause is enabled only when both sorties
@@ -172,15 +186,54 @@ def _new_solver(time_limit: float) -> cp_model.CpSolver:
 
 def run_solve(sorties, pair_constraints: list[PairConstraint],
               locks: dict[str, int] | None = None,
-              time_limit: float = 30.0, max_cores: int = 40) -> SolveResult:
+              time_limit: float = 30.0, max_cores: int = 40,
+              solver_factory=_new_solver) -> SolveResult:
+    """Staged CP-SAT solve that never lets a later time-out destroy an
+    already-proven feasible take-off table.
+
+    Stages (all sharing the single wall-clock budget ``time_limit``):
+
+    0. feasibility probe with every sortie participating;
+    1. weighted-delay minimization;
+    2. lexicographic tie-break over sortie-ID-ordered offsets.
+
+    The *incumbent* is the best witness seen so far.  It is replaced only by a
+    witness produced under a model containing every constraint already proven
+    (optimal objective value, previously fixed coordinates) and no worse on the
+    stage metric.  A stage returning ``UNKNOWN`` therefore falls back to the
+    incumbent instead of discarding it.  ``optimal`` is claimed only when the
+    weighted objective AND every lexicographic round are proven optimal; a
+    proven feasible table with an unfinished proof yields ``feasible``.  A
+    genuine ``INFEASIBLE`` probe still returns ``infeasible`` with cores,
+    distinct from an ``unknown`` probe that found neither a witness nor a
+    proof.
+    """
     locks = dict(locks or {})
     t_start = time.perf_counter()
+    deadline = t_start + float(time_limit)
     model, takeoff, participate = _build_model(sorties, pair_constraints, locks)
     idx_to_id = {v.Index(): sid for sid, v in participate.items()}
-    solver = _new_solver(time_limit)
 
-    # Initial solve with all sorties participating (feasibility probe).
-    model.AddAssumptions([participate[sid] for sid in sorted(participate)])
+    def remaining() -> float:
+        return max(0.0, deadline - time.perf_counter())
+
+    def make_solver():
+        # ``solver_factory`` is injectable for deterministic tests (scripted
+        # status sequence); production always yields a real cp_model.CpSolver.
+        return solver_factory(remaining())
+
+    weights = {s.id: s.weight for s in sorties}
+    ids = sorted(takeoff)
+
+    def witness(solver) -> tuple[dict[str, int], int]:
+        off = {sid: solver.Value(takeoff[sid]) for sid in ids}
+        return off, sum(weights[sid] * v for sid, v in off.items())
+
+    # ------------------------------------------------------------------
+    # Stage 0: feasibility probe (all sorties participating).
+    # ------------------------------------------------------------------
+    model.AddAssumptions([participate[sid] for sid in ids])
+    solver = make_solver()
     status = solver.Solve(model)
 
     if status == cp_model.INFEASIBLE:
@@ -206,38 +259,72 @@ def run_solve(sorties, pair_constraints: list[PairConstraint],
             locked=locks,
         )
 
-    # Phase 1: minimise weighted total delay (relative to earliest take-off).
-    weights = {s.id: s.weight for s in sorties}
-    model.Minimize(sum(weights[sid] * v for sid, v in takeoff.items()))
-    status = solver.Solve(model)
-    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return SolveResult(
-            feasible=False,
-            status=solver.StatusName(status).lower(),
-            pair_constraints=pair_constraints,
-            elapsed_seconds=time.perf_counter() - t_start,
-            locked=locks,
-        )
-    proven_optimal = status == cp_model.OPTIMAL
-    best_obj = int(round(solver.ObjectiveValue()))
-    offsets = {sid: solver.Value(v) for sid, v in takeoff.items()}
+    # Proven feasible table from the probe; kept for the lifetime of the call.
+    offsets, best_obj = witness(solver)
+    objective = sum(weights[sid] * v for sid, v in takeoff.items())
 
-    # Phase 2: lexicographically smallest offset sequence (sortie ID order),
-    # restricted to the proven-optimal objective value.
-    if proven_optimal:
-        model.Add(sum(weights[sid] * v for sid, v in takeoff.items()) == best_obj)
-        for sid in sorted(takeoff):
+    # ------------------------------------------------------------------
+    # Stage 1: minimise weighted total delay.
+    # ------------------------------------------------------------------
+    model.Minimize(objective)
+    if remaining() > 0:
+        solver = make_solver()
+        status = solver.Solve(model)
+        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            cand, cand_obj = witness(solver)
+            if cand_obj <= best_obj:
+                offsets, best_obj = cand, cand_obj
+        # UNKNOWN / invalid: the probe witness remains the incumbent.
+        objective_optimal = status == cp_model.OPTIMAL
+
+        # ----------------------------------------------------------------
+        # Stage 2: lexicographically smallest offset sequence in sortie ID
+        # order, without worsening the incumbent objective.
+        #
+        # The objective bound keeps every later witness inside the proven /
+        # incumbent cone.  When the weighted optimum is proven the bound pins
+        # the exact optimum; otherwise it only rejects strictly worse tables.
+        model.Add(objective <= best_obj)
+        lex_optimal = objective_optimal
+        for sid in ids:
+            if remaining() <= 0:
+                lex_optimal = False
+                break
             model.Minimize(takeoff[sid])
+            solver = make_solver()
             st = solver.Solve(model)
-            if st in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            if st == cp_model.OPTIMAL:
+                # Coordinate proven minimal: fix it for all later rounds.
                 val = solver.Value(takeoff[sid])
                 model.Add(takeoff[sid] == val)
-        offsets = {sid: solver.Value(v) for sid, v in takeoff.items()}
-        best_obj = sum(weights[k] * v for k, v in offsets.items())
+                cand, cand_obj = witness(solver)
+                if cand_obj <= best_obj:
+                    offsets, best_obj = cand, cand_obj
+            elif st == cp_model.FEASIBLE:
+                # Witness is valid but NOT proven minimal for this coordinate;
+                # never fix it as if proven.  Tighten only with the
+                # non-worsening bound, adopt the witness if it improves the
+                # lexicographic sequence, and let later rounds continue.
+                cand, cand_obj = witness(solver)
+                cand_seq = tuple(cand[k] for k in ids)
+                inc_seq = tuple(offsets[k] for k in ids)
+                if cand_obj <= best_obj and cand_seq <= inc_seq:
+                    offsets, best_obj = cand, cand_obj
+                model.Add(takeoff[sid] <= offsets[sid])
+                lex_optimal = False
+            else:
+                # UNKNOWN (time-out) / MODEL_INVALID: keep the incumbent and
+                # carry only the non-worsening bound for this coordinate, so a
+                # later round cannot degrade the sequence.
+                model.Add(takeoff[sid] <= offsets[sid])
+                lex_optimal = False
+    else:
+        objective_optimal = False
+        lex_optimal = False
 
     return SolveResult(
         feasible=True,
-        status="optimal" if proven_optimal else "feasible",
+        status="optimal" if (objective_optimal and lex_optimal) else "feasible",
         offsets=offsets,
         weighted_delay=best_obj,
         pair_constraints=pair_constraints,

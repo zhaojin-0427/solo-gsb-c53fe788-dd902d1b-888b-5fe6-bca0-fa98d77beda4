@@ -123,7 +123,9 @@ async function solve(extraLocks) {
     state.history = await fetchHistory();
     renderAll();
     if (dto.solution.feasible) toast("求解成功，已生成无冲突起飞时刻");
-    else toast("当前条件无解，已列出极小无解架次集合", 4000);
+    else if (dto.solution.status === "unknown") {
+      toast("求解超时：暂未找到可行表，也未证明无解；已有方案保持不变", 4200);
+    } else toast("当前条件无解，已列出极小无解架次集合", 4000);
   } catch (e) {
     toast("求解失败：" + e.message, 4200);
   }
@@ -279,7 +281,15 @@ function renderResultPanel() {
     return;
   }
   panel.classList.remove("hidden");
-  if (!sol.feasible) {
+  if (sol.status === "unknown") {
+    title.textContent = "⏳ 求解超时 — 可行与无解均未证明";
+    body.innerHTML = `
+      <div class="kv bad"><span>状态</span><b>${sol.status}</b></div>
+      <div class="hint" style="margin-top:6px">
+        在给定时限内 CP-SAT 既没有找到可行起飞表，也没有证明无解。这与“确实无解”不同：
+        可加大求解时限后重试。若此前已保存过可行方案，该方案仍保留在 SQLite 中，
+        已建执行批次不受影响。</div>`;
+  } else if (!sol.feasible) {
     title.textContent = "⚠️ 无解 — 极小无解架次集合";
     let html = `<div class="kv bad"><span>状态</span><b>${sol.status}</b></div>`;
     html += `<div class="hint" style="margin-top:6px">下列每个集合都是包含关系极小的：删去其中任意一架次，其余架次即可消解。互斥时差 Δ = 后者起飞 − 前者起飞（秒）。</div>`;
